@@ -1,11 +1,19 @@
 import { Alert, AlertDescription } from "@deadlock-mods/ui/components/alert";
 import { Button } from "@deadlock-mods/ui/components/button";
 import { Card, CardFooter } from "@deadlock-mods/ui/components/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@deadlock-mods/ui/components/select";
 import { toast } from "@deadlock-mods/ui/components/sonner";
 import { ArrowLeft, RefreshCw, Trash } from "@deadlock-mods/ui/icons";
 import { Warning } from "@phosphor-icons/react";
+import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router";
 import ModButton from "@/components/mod-browsing/mod-button";
@@ -71,6 +79,11 @@ const Mod = () => {
   const availableFiles = rawAvailableFiles as unknown as ModDownloadItem[];
 
   const localMods = usePersistedStore((state) => state.localMods);
+  const setSelectedDownloads = usePersistedStore(
+    (state) => state.setSelectedDownloads,
+  );
+  const setInstalledVpks = usePersistedStore((state) => state.setInstalledVpks);
+  const getActiveProfile = usePersistedStore((state) => state.getActiveProfile);
   const developerMode = usePersistedStore((state) => state.developerMode);
   const localMod = localMods.find((m) => m.remoteId === mod?.remoteId);
 
@@ -92,6 +105,9 @@ const Mod = () => {
   const { uninstall } = useUninstall();
 
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [selectedVariantName, setSelectedVariantName] = useState<string>("");
+  const [isApplyingVariant, setIsApplyingVariant] = useState(false);
+  const [cachedVariantCount, setCachedVariantCount] = useState(0);
 
   const currentModUpdate = updatableMods.filter(
     (update) => update.mod.remoteId === mod?.remoteId,
@@ -107,6 +123,104 @@ const Mod = () => {
 
   const effectiveUpdateData =
     currentModUpdate.length > 0 ? currentModUpdate : forceUpdateData;
+
+  const sortedAvailableFiles = useMemo(
+    () => [...(availableFiles ?? [])].sort((a, b) => (b.size || 0) - (a.size || 0)),
+    [availableFiles],
+  );
+
+  useEffect(() => {
+    if (sortedAvailableFiles.length === 0) {
+      setSelectedVariantName("");
+      return;
+    }
+
+    const currentSelectedVariant = localMod?.selectedDownloads?.[0]?.name;
+    const defaultVariant =
+      sortedAvailableFiles.find((file) => file.name === currentSelectedVariant)
+        ?.name ?? sortedAvailableFiles[0]?.name;
+
+    if (defaultVariant) {
+      setSelectedVariantName(defaultVariant);
+    }
+  }, [sortedAvailableFiles, localMod?.selectedDownloads]);
+
+  useEffect(() => {
+    const loadCachedVariants = async () => {
+      if (!localMod?.remoteId || sortedAvailableFiles.length <= 1) {
+        setCachedVariantCount(0);
+        return;
+      }
+
+      try {
+        const cachedFiles = (await invoke<string[]>("get_cached_variant_files", {
+          modId: localMod.remoteId,
+        })) as string[];
+        setCachedVariantCount(cachedFiles.length);
+      } catch {
+        setCachedVariantCount(0);
+      }
+    };
+
+    loadCachedVariants();
+  }, [localMod?.remoteId, sortedAvailableFiles.length, isApplyingVariant]);
+
+  const applyVariantFromCache = async () => {
+    if (!localMod || !selectedVariantName) {
+      return;
+    }
+
+    try {
+      setIsApplyingVariant(true);
+
+      const activeProfile = getActiveProfile();
+      const profileFolder = activeProfile?.folderName ?? null;
+
+      const updatedInstalledVpks = (await invoke<string[]>(
+        "apply_mod_variant_from_cache",
+        {
+          modId: localMod.remoteId,
+          variantFileName: selectedVariantName,
+          installedVpks: localMod.installedVpks ?? [],
+          profileFolder,
+        },
+      )) as string[];
+
+      const selectedVariant = sortedAvailableFiles.find(
+        (file) => file.name === selectedVariantName,
+      );
+
+      if (selectedVariant) {
+        setSelectedDownloads(localMod.remoteId, [selectedVariant]);
+      }
+
+      if (updatedInstalledVpks.length > 0) {
+        setInstalledVpks(localMod.remoteId, updatedInstalledVpks);
+      }
+
+      toast.success(
+        t("modDetail.variantApplied", {
+          defaultValue: "Variant applied successfully",
+        }),
+      );
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : t("common.unknownError", { defaultValue: "Unknown error" });
+
+      toast.error(
+        t("modDetail.variantApplyFailed", {
+          defaultValue: "Failed to apply variant: {{error}}",
+          error: errorMessage,
+        }),
+      );
+    } finally {
+      setIsApplyingVariant(false);
+    }
+  };
 
   const deleteMod = async () => {
     if (!localMod) {
@@ -283,6 +397,61 @@ const Mod = () => {
             files={availableFiles}
             isDownloadable={!!mod.downloadable}
           />
+
+          {isInstalled && sortedAvailableFiles.length > 1 && (
+            <Card className='shadow-none' style={{ contain: "layout style paint" }}>
+              <div className='p-4 space-y-3'>
+                <div>
+                  <h3 className='font-semibold text-sm'>
+                    {t("modDetail.variantSwitcherTitle", {
+                      defaultValue: "Variant Switcher",
+                    })}
+                  </h3>
+                  <p className='text-muted-foreground text-xs'>
+                    {t("modDetail.variantSwitcherDescription", {
+                      defaultValue:
+                        "Switch to a cached variant instantly without redownloading.",
+                    })}
+                  </p>
+                  <p className='text-muted-foreground text-xs'>
+                    {t("modDetail.cachedVariantsCount", {
+                      defaultValue: "Cached variants: {{count}}",
+                      count: cachedVariantCount,
+                    })}
+                  </p>
+                </div>
+
+                <div className='flex items-center gap-2'>
+                  <Select
+                    value={selectedVariantName}
+                    onValueChange={setSelectedVariantName}>
+                    <SelectTrigger className='flex-1'>
+                      <SelectValue
+                        placeholder={t("modDetail.selectVariant", {
+                          defaultValue: "Select variant",
+                        })}
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {sortedAvailableFiles.map((file) => (
+                        <SelectItem key={file.name} value={file.name}>
+                          {file.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  <Button
+                    onClick={applyVariantFromCache}
+                    isLoading={isApplyingVariant}
+                    disabled={!selectedVariantName || isApplyingVariant}
+                    variant='outline'>
+                    {t("modDetail.applyVariant", { defaultValue: "Apply Variant" })}
+                  </Button>
+                </div>
+              </div>
+            </Card>
+          )}
 
           {mod.audioUrl && (
             <ModAudioPreview audioUrl={mod.audioUrl} isAudio={!!mod.isAudio} />

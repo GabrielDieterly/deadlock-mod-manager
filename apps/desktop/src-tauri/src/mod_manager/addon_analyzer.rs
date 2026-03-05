@@ -1,6 +1,7 @@
 use crate::errors::Error;
 use reqwest;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 use tokio::task;
@@ -219,6 +220,7 @@ impl AddonAnalyzer {
     &self,
     game_path: PathBuf,
     profile_folder: Option<String>,
+    tracked_vpk_to_mod: HashMap<String, (String, String)>,
     app_handle: Option<AppHandle>,
   ) -> Result<AnalyzeAddonsResult, Error> {
     log::info!(
@@ -390,7 +392,24 @@ impl AddonAnalyzer {
         let progress = 15 + ((processed_files as f32 / total_files as f32) * 35.0) as u8; // 15-50%
 
         match handle.await {
-          Ok(Ok(addon_info)) => {
+          Ok(Ok(mut addon_info)) => {
+            if let Some((mod_id, mod_name)) = tracked_vpk_to_mod.get(&addon_info.file_name) {
+              addon_info.remote_id = Some(mod_id.clone());
+              addon_info.match_info = Some(MatchInfo {
+                certainty: 100,
+                match_type: "contentSignature".to_string(),
+                mod_name: Some(mod_name.clone()),
+                mod_author: Some("Local Library".to_string()),
+                alternative_matches: None,
+              });
+              log::debug!(
+                "Identified addon from tracked installed VPK: {} -> {} ({})",
+                addon_info.file_name,
+                mod_name,
+                mod_id
+              );
+            }
+
             // Emit progress with current file info
             self.emit_progress(
               &app_handle,

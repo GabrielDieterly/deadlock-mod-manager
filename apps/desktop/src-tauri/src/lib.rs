@@ -141,6 +141,8 @@ pub fn run() {
       commands::get_download_status,
       commands::get_all_downloads,
       commands::replace_mod_vpks,
+      commands::apply_mod_variant_from_cache,
+      commands::get_cached_variant_files,
       commands::copy_selected_vpks_from_archive,
       commands::copy_local_mod_vpks,
       commands::trigger_cache_scan,

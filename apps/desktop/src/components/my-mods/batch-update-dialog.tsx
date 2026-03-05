@@ -11,6 +11,13 @@ import {
 import { Progress } from "@deadlock-mods/ui/components/progress";
 import { Checkbox } from "@deadlock-mods/ui/components/checkbox";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@deadlock-mods/ui/components/select";
+import {
   AlertCircle,
   Calendar,
   HardDrive,
@@ -19,7 +26,7 @@ import {
   X,
 } from "@deadlock-mods/ui/icons";
 import { toast } from "@deadlock-mods/ui/components/sonner";
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation } from "@tanstack/react-query";
 import { DateDisplay } from "@/components/date-display";
@@ -50,6 +57,8 @@ export const BatchUpdateDialog = ({
     executeBatchUpdate,
     updateProgress,
   } = useBatchUpdate();
+  const hasPreparedForOpenRef = useRef(false);
+  const [cacheAllVariants, setCacheAllVariants] = useState(true);
 
   const batchUpdateMutation = useMutation({
     mutationFn: executeBatchUpdate,
@@ -69,10 +78,36 @@ export const BatchUpdateDialog = ({
   };
 
   useEffect(() => {
-    if (open && updates.length > 0) {
+    if (!open) {
+      hasPreparedForOpenRef.current = false;
+      setCacheAllVariants(true);
+      return;
+    }
+
+    if (!hasPreparedForOpenRef.current && updates.length > 0) {
       prepareUpdates(updates);
+      hasPreparedForOpenRef.current = true;
     }
   }, [open, updates, prepareUpdates]);
+
+  useEffect(() => {
+    if (!open || !isSingleMod) {
+      return;
+    }
+
+    for (const update of updatableMods) {
+      if (update.downloads.length <= 1) {
+        continue;
+      }
+
+      if (update.selectedDownloads.length !== 1) {
+        const fallback = update.selectedDownloads[0] ?? update.downloads[0];
+        if (fallback) {
+          setSelectedDownloads(update.mod.remoteId, [fallback]);
+        }
+      }
+    }
+  }, [open, isSingleMod, updatableMods, setSelectedDownloads]);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -117,10 +152,34 @@ export const BatchUpdateDialog = ({
               </p>
             </div>
 
+            {isSingleMod &&
+              updatableMods.some((update) => update.downloads.length > 1) && (
+                <div className='rounded-lg border p-3 flex items-center justify-between'>
+                  <div>
+                    <p className='font-medium text-sm'>
+                      {t("modDetail.cacheAllVariants", {
+                        defaultValue: "Download all variants to cache",
+                      })}
+                    </p>
+                    <p className='text-xs text-muted-foreground'>
+                      {t("modDetail.cacheAllVariantsDescription", {
+                        defaultValue:
+                          "Downloads all variants now so you can switch instantly later.",
+                      })}
+                    </p>
+                  </div>
+                  <Checkbox
+                    checked={cacheAllVariants}
+                    onCheckedChange={(checked) => setCacheAllVariants(!!checked)}
+                  />
+                </div>
+              )}
+
             <div className='space-y-3'>
               {updatableMods.map((update) => (
                 <UpdateModCard
                   key={update.mod.remoteId}
+                  isSingleMod={isSingleMod}
                   update={update}
                   onSelectDownloads={setSelectedDownloads}
                 />
@@ -140,7 +199,11 @@ export const BatchUpdateDialog = ({
                 {t("common.cancel")}
               </Button>
               <Button
-                onClick={() => batchUpdateMutation.mutate()}
+                onClick={() =>
+                  batchUpdateMutation.mutate({
+                    downloadAllVariants: isSingleMod && cacheAllVariants,
+                  })
+                }
                 disabled={batchUpdateMutation.isPending}
                 icon={<RefreshCw className='h-4 w-4' />}>
                 {isSingleMod ? t("modDetail.updateMod") : t("myMods.updateAll")}
@@ -155,10 +218,15 @@ export const BatchUpdateDialog = ({
 
 interface UpdateModCardProps {
   update: UpdatableMod;
+  isSingleMod?: boolean;
   onSelectDownloads: (remoteId: string, downloads: ModDownloadItem[]) => void;
 }
 
-const UpdateModCard = ({ update, onSelectDownloads }: UpdateModCardProps) => {
+const UpdateModCard = ({
+  update,
+  isSingleMod = false,
+  onSelectDownloads,
+}: UpdateModCardProps) => {
   const { t } = useTranslation();
   const localMods = usePersistedStore((state) => state.localMods);
   const localMod = localMods.find((m) => m.remoteId === update.mod.remoteId);
@@ -184,6 +252,9 @@ const UpdateModCard = ({ update, onSelectDownloads }: UpdateModCardProps) => {
     (sum, d) => sum + (d.size || 0),
     0,
   );
+
+  const selectedVariantName =
+    update.selectedDownloads[0]?.name ?? sortedDownloads[0]?.name;
 
   return (
     <div className='flex items-start gap-4 rounded-lg border p-4'>
@@ -220,7 +291,46 @@ const UpdateModCard = ({ update, onSelectDownloads }: UpdateModCardProps) => {
           </div>
         </div>
 
-        {update.downloads.length > 1 && (
+        {update.downloads.length > 1 && isSingleMod && (
+          <div className='space-y-2'>
+            <div className='flex items-center justify-between'>
+              <label className='text-sm font-medium'>
+                {t("myMods.batchUpdate.selectVariant")}
+              </label>
+              <div className='flex items-center gap-2 text-muted-foreground text-sm'>
+                <HardDrive className='h-4 w-4' />
+                {formatSize(totalSize)}
+              </div>
+            </div>
+
+            <Select
+              value={selectedVariantName}
+              onValueChange={(value) => {
+                const selected = sortedDownloads.find((d) => d.name === value);
+                if (selected) {
+                  onSelectDownloads(update.mod.remoteId, [selected]);
+                }
+              }}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {sortedDownloads.map((download) => (
+                  <SelectItem key={download.name} value={download.name}>
+                    <div className='flex items-center gap-2'>
+                      <span className='truncate max-w-[20rem]'>{download.name}</span>
+                      <span className='text-muted-foreground text-xs'>
+                        {formatSize(download.size)}
+                      </span>
+                    </div>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+
+        {update.downloads.length > 1 && !isSingleMod && (
           <div className='space-y-2'>
             <div className='flex items-center justify-between'>
               <label className='text-sm font-medium'>

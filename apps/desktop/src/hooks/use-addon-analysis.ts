@@ -10,6 +10,15 @@ import logger from "@/lib/logger";
 import { usePersistedStore } from "@/lib/store";
 import type { AddonAnalysisProgress } from "@/types/mods";
 
+type AnalyzeAddonsInput = {
+  profileFolder: string | null;
+  trackedInstalledMods: Array<{
+    modId: string;
+    modName: string;
+    installedVpks: string[];
+  }>;
+};
+
 export const useAddonAnalysis = () => {
   const { t } = useTranslation();
   const { analytics } = useAnalyticsContext();
@@ -20,6 +29,7 @@ export const useAddonAnalysis = () => {
     null,
   );
   const analysisResult = usePersistedStore((state) => state.analysisResult);
+  const localMods = usePersistedStore((state) => state.localMods);
   const dialogOpen = usePersistedStore((state) => state.analysisDialogOpen);
   const setAnalysisResult = usePersistedStore(
     (state) => state.setAnalysisResult,
@@ -67,7 +77,8 @@ export const useAddonAnalysis = () => {
   }, []);
 
   const { mutate: analyzeAddons, isPending } = useMutation({
-    mutationFn: analyzeLocalAddons,
+    mutationFn: ({ profileFolder, trackedInstalledMods }: AnalyzeAddonsInput) =>
+      analyzeLocalAddons(profileFolder, trackedInstalledMods),
     onSuccess: async (data) => {
       setAnalysisResult(data);
 
@@ -197,7 +208,18 @@ export const useAddonAnalysis = () => {
     const activeProfile = getActiveProfile();
     const profileFolder = activeProfile?.folderName ?? null;
 
-    analyzeAddons(profileFolder);
+    const trackedInstalledMods = localMods
+      .filter((mod) => (mod.installedVpks?.length ?? 0) > 0)
+      .map((mod) => ({
+        modId: mod.id,
+        modName: mod.name,
+        installedVpks: mod.installedVpks ?? [],
+      }));
+
+    analyzeAddons({
+      profileFolder,
+      trackedInstalledMods,
+    });
   };
 
   const dismissProgressToast = () => {

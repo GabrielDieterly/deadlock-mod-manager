@@ -15,7 +15,7 @@ use crate::mod_manager::{
 use crate::reports::{CreateReportRequest, CreateReportResponse, ReportCounts, ReportService};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_store::StoreExt;
@@ -63,6 +63,21 @@ pub fn get_api_url() -> String {
       "http://localhost:9000".to_string()
     }
   }
+}
+
+fn collect_vpk_files(dir: &Path, vpk_files: &mut Vec<PathBuf>) -> Result<(), Error> {
+  for entry in std::fs::read_dir(dir)? {
+    let entry = entry?;
+    let path = entry.path();
+
+    if path.is_dir() {
+      collect_vpk_files(&path, vpk_files)?;
+    } else if path.extension().is_some_and(|ext| ext == "vpk") {
+      vpk_files.push(path);
+    }
+  }
+
+  Ok(())
 }
 
 #[tauri::command]
@@ -669,20 +684,51 @@ pub async fn check_addons_exist(profile_folder: Option<String>) -> Result<bool, 
 pub async fn analyze_local_addons(
   app_handle: AppHandle,
   profile_folder: Option<String>,
+  tracked_mods: Option<Vec<TrackedAnalysisMod>>,
 ) -> Result<AnalyzeAddonsResult, Error> {
-  let game_path = {
+  let (game_path, tracked_vpk_to_mod) = {
     let mod_manager = MANAGER.lock().unwrap();
-    match mod_manager.get_steam_manager().get_game_path() {
+    let game_path = match mod_manager.get_steam_manager().get_game_path() {
       Some(path) => path.clone(),
       None => return Err(Error::GamePathNotSet),
+    };
+
+    let mut tracked_vpk_to_mod = std::collections::HashMap::new();
+    for mod_entry in mod_manager.get_mod_repository().get_all_mods() {
+      for vpk_name in &mod_entry.installed_vpks {
+        tracked_vpk_to_mod.insert(
+          vpk_name.clone(),
+          (mod_entry.id.clone(), mod_entry.name.clone()),
+        );
+      }
     }
+
+    (game_path, tracked_vpk_to_mod)
   }; // Lock is released here
+
+  let mut tracked_vpk_to_mod = tracked_vpk_to_mod;
+  if let Some(tracked_mods) = tracked_mods {
+    for tracked_mod in tracked_mods {
+      for vpk_name in tracked_mod.installed_vpks {
+        tracked_vpk_to_mod.insert(vpk_name, (tracked_mod.mod_id.clone(), tracked_mod.mod_name.clone()));
+      }
+    }
+  }
 
   let analyzer = AddonAnalyzer::new();
   let result = analyzer
-    .analyze_local_addons(game_path, profile_folder, Some(app_handle))
+    .analyze_local_addons(game_path, profile_folder, tracked_vpk_to_mod, Some(app_handle))
     .await?;
   Ok(result)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackedAnalysisMod {
+  pub mod_id: String,
+  pub mod_name: String,
+  #[serde(default)]
+  pub installed_vpks: Vec<String>,
 }
 
 #[tauri::command]
@@ -856,6 +902,7 @@ pub async fn queue_download(
     profile_folder,
     is_profile_import: false,
     file_tree: None,
+    preferred_file_name: None,
   };
 
   let manager = get_download_manager(app_handle).await;
@@ -958,17 +1005,6 @@ pub async fn copy_selected_vpks_from_archive(
   log::info!("Removing extracted directory: {extracted_dir:?}");
   std::fs::remove_dir_all(&extracted_dir)?;
 
-  let extractor = ArchiveExtractor::new();
-  for entry in std::fs::read_dir(&mod_dir)? {
-    let entry = entry?;
-    let path = entry.path();
-    if extractor.is_supported_archive(&path) {
-      log::info!("Removing archive: {path:?}");
-      std::fs::remove_file(&path)?;
-      break;
-    }
-  }
-
   log::info!("Successfully copied selected VPKs for mod: {}", mod_id);
   Ok(())
 }
@@ -1035,6 +1071,41 @@ pub async fn copy_local_mod_vpks(
 }
 
 #[tauri::command]
+pub async fn get_cached_variant_files(mod_id: String) -> Result<Vec<String>, Error> {
+  log::info!("Getting cached variant files for mod: {}", mod_id);
+
+  let mod_manager = MANAGER.lock().unwrap();
+  let mod_dir = mod_manager.get_validated_mod_folder_path(&mod_id)?;
+
+  if !mod_dir.exists() {
+    return Ok(Vec::new());
+  }
+
+  let extractor = ArchiveExtractor::new();
+  let mut cached_files = Vec::new();
+
+  for entry in std::fs::read_dir(&mod_dir)? {
+    let entry = entry?;
+    let path = entry.path();
+
+    if !path.is_file() {
+      continue;
+    }
+
+    if extractor.is_supported_archive(&path)
+      || path.extension().and_then(|e| e.to_str()) == Some("vpk")
+    {
+      if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        cached_files.push(name.to_string());
+      }
+    }
+  }
+
+  cached_files.sort();
+  Ok(cached_files)
+}
+
+#[tauri::command]
 pub async fn replace_mod_vpks(
   mod_id: String,
   source_vpk_paths: Vec<String>,
@@ -1070,6 +1141,113 @@ pub async fn replace_mod_vpks(
 
   log::info!("VPK replacement command completed successfully");
   Ok(())
+}
+
+#[tauri::command]
+pub async fn apply_mod_variant_from_cache(
+  mod_id: String,
+  variant_file_name: String,
+  installed_vpks: Vec<String>,
+  profile_folder: Option<String>,
+) -> Result<Vec<String>, Error> {
+  log::info!(
+    "Applying cached variant for mod {} using file {} (profile: {:?})",
+    mod_id,
+    variant_file_name,
+    profile_folder
+  );
+
+  let (mod_dir, mut effective_installed_vpks) = {
+    let mod_manager = MANAGER.lock().unwrap();
+    let mod_dir = mod_manager.get_validated_mod_folder_path(&mod_id)?;
+
+    let effective_installed_vpks = if !installed_vpks.is_empty() {
+      installed_vpks
+    } else if let Some(mod_info) = mod_manager.get_mod_repository().get_mod(&mod_id) {
+      mod_info.installed_vpks.clone()
+    } else {
+      Vec::new()
+    };
+
+    (mod_dir, effective_installed_vpks)
+  };
+
+  if !mod_dir.exists() {
+    return Err(Error::ModFileNotFound);
+  }
+
+  let variant_path = mod_dir.join(&variant_file_name);
+  if !variant_path.exists() {
+    return Err(Error::InvalidInput(format!(
+      "Variant file not found in cache: {}",
+      variant_path.display()
+    )));
+  }
+
+  let extractor = ArchiveExtractor::new();
+  let extracted_dir = mod_dir.join("variant-extracted");
+  let source_vpk_paths: Vec<PathBuf>;
+
+  if variant_path.extension().and_then(|e| e.to_str()) == Some("vpk") {
+    source_vpk_paths = vec![variant_path.clone()];
+  } else if extractor.is_supported_archive(&variant_path) {
+    if extracted_dir.exists() {
+      std::fs::remove_dir_all(&extracted_dir)?;
+    }
+    std::fs::create_dir_all(&extracted_dir)?;
+
+    extractor.extract_archive(&variant_path, &extracted_dir)?;
+
+    let mut collected_vpks = Vec::new();
+    collect_vpk_files(&extracted_dir, &mut collected_vpks)?;
+    collected_vpks.sort();
+    source_vpk_paths = collected_vpks;
+  } else {
+    return Err(Error::InvalidInput(format!(
+      "Unsupported variant file type: {}",
+      variant_file_name
+    )));
+  }
+
+  if source_vpk_paths.is_empty() {
+    return Err(Error::InvalidInput(
+      "No VPK files found in selected variant".to_string(),
+    ));
+  }
+
+  if !effective_installed_vpks.is_empty()
+    && source_vpk_paths.len() != effective_installed_vpks.len()
+  {
+    return Err(Error::InvalidInput(format!(
+      "Variant VPK count ({}) does not match currently installed VPK count ({})",
+      source_vpk_paths.len(),
+      effective_installed_vpks.len()
+    )));
+  }
+
+  {
+    let mut mod_manager = MANAGER.lock().unwrap();
+
+    if effective_installed_vpks.is_empty()
+      && let Some(mod_info) = mod_manager.get_mod_repository().get_mod(&mod_id)
+    {
+      effective_installed_vpks = mod_info.installed_vpks.clone();
+    }
+
+    mod_manager.replace_mod_vpks(
+      mod_id.clone(),
+      source_vpk_paths,
+      effective_installed_vpks.clone(),
+      profile_folder,
+    )?;
+  }
+
+  if extracted_dir.exists() {
+    std::fs::remove_dir_all(&extracted_dir)?;
+  }
+
+  log::info!("Successfully applied cached variant for mod {}", mod_id);
+  Ok(effective_installed_vpks)
 }
 
 // ============================================================================
@@ -1620,6 +1798,7 @@ pub async fn import_profile_batch(
       profile_folder: Some(final_profile_folder.clone()),
       is_profile_import: true,
       file_tree: mod_data.file_tree.clone(),
+      preferred_file_name: None,
     };
 
     let manager = get_download_manager(app_handle.clone()).await;
@@ -1636,7 +1815,7 @@ pub async fn import_profile_batch(
 
       match manager.get_download_status(&mod_data.mod_id).await {
         Ok(Some(status)) => {
-          if status.status == "downloading" {
+          if status.status == "downloading" || status.status == "processing" {
             continue;
           }
           download_complete = true;
@@ -1851,6 +2030,8 @@ pub struct BatchUpdateMod {
   pub file_tree: Option<ModFileTree>,
   #[serde(default)]
   pub installed_vpks: Vec<String>,
+  #[serde(default)]
+  pub selected_variant_file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1987,7 +2168,7 @@ pub async fn batch_update_mods(
       }
     }
 
-    let installed_vpk_cleanup_result: Result<usize, Error> = {
+    let installed_vpk_cleanup_result: Result<(usize, Option<u32>), Error> = {
       let mut mod_manager = MANAGER.lock().unwrap();
       if let Some(existing_mod) = mod_manager
         .get_mod_repository()
@@ -1995,6 +2176,7 @@ pub async fn batch_update_mods(
         .cloned()
       {
         let mut removed_count = 0;
+        let existing_install_order = existing_mod.install_order;
         for vpk in &existing_mod.installed_vpks {
           let vpk_path = addons_path_for_profile.join(vpk);
           if vpk_path.exists() {
@@ -2009,27 +2191,27 @@ pub async fn batch_update_mods(
         mod_manager
           .get_mod_repository_mut()
           .remove_mod(&mod_data.mod_id);
-        Ok(removed_count)
+        Ok((removed_count, existing_install_order))
       } else {
-        Ok(0)
+        Ok((0, None))
       }
     };
 
-    let repo_cleanup_count = match installed_vpk_cleanup_result {
-      Ok(count) if count > 0 => {
+    let (existing_install_order, removed_installed_vpk_count) = match installed_vpk_cleanup_result {
+      Ok((count, install_order)) if count > 0 => {
         log::info!(
           "Removed {} currently installed VPKs for mod {}",
           count,
           mod_data.mod_id
         );
-        count
+        (install_order, count)
       }
-      Ok(_) => {
+      Ok((_, install_order)) => {
         log::debug!(
           "No currently installed VPKs to remove for mod {}",
           mod_data.mod_id
         );
-        0
+        (install_order, 0)
       }
       Err(e) => {
         log::warn!(
@@ -2037,17 +2219,16 @@ pub async fn batch_update_mods(
           mod_data.mod_id,
           e
         );
-        0
+        (None, 0)
       }
     };
 
-    let prefixed_cleanup_count = cleanup_result.unwrap_or(0);
-    if prefixed_cleanup_count == 0 && repo_cleanup_count == 0 && !mod_data.installed_vpks.is_empty()
-    {
+    if !mod_data.installed_vpks.is_empty() {
       log::info!(
-        "Using frontend-provided VPK list for cleanup of mod {} ({} VPKs)",
+        "Applying frontend-provided VPK cleanup for mod {} ({} VPKs, backend removed: {})",
         mod_data.mod_id,
-        mod_data.installed_vpks.len()
+        mod_data.installed_vpks.len(),
+        removed_installed_vpk_count
       );
       for vpk in &mod_data.installed_vpks {
         let vpk_filename = std::path::Path::new(vpk)
@@ -2099,6 +2280,7 @@ pub async fn batch_update_mods(
       },
       is_profile_import: false,
       file_tree: mod_data.file_tree.clone(),
+      preferred_file_name: mod_data.selected_variant_file_name.clone(),
     };
 
     let manager = get_download_manager(app_handle.clone()).await;
@@ -2114,7 +2296,7 @@ pub async fn batch_update_mods(
 
       match manager.get_download_status(&mod_data.mod_id).await {
         Ok(Some(status)) => {
-          if status.status == "downloading" {
+          if status.status == "downloading" || status.status == "processing" {
             continue;
           }
           download_complete = true;
@@ -2211,7 +2393,7 @@ pub async fn batch_update_mods(
         name: mod_data.mod_name.clone(),
         installed_vpks: Vec::new(),
         file_tree: mod_data.file_tree.clone(),
-        install_order: None,
+        install_order: existing_install_order,
         original_vpk_names: Vec::new(),
       };
 
@@ -2227,6 +2409,41 @@ pub async fn batch_update_mods(
 
     match install_result {
       Ok(installed_mod) => {
+        if installed_mod.installed_vpks.is_empty() {
+          log::error!(
+            "Updated mod {} produced no installed VPKs after install",
+            mod_data.mod_id
+          );
+          failed.push((
+            mod_data.mod_id.clone(),
+            "Install completed but produced no installed VPKs".to_string(),
+          ));
+          continue;
+        }
+
+        let missing_vpks: Vec<String> = installed_mod
+          .installed_vpks
+          .iter()
+          .filter(|vpk| !addons_path_for_profile.join(vpk).exists())
+          .cloned()
+          .collect();
+
+        if !missing_vpks.is_empty() {
+          log::error!(
+            "Updated mod {} has missing installed VPK files after install: {:?}",
+            mod_data.mod_id,
+            missing_vpks
+          );
+          failed.push((
+            mod_data.mod_id.clone(),
+            format!(
+              "Install completed but some installed VPK files are missing: {:?}",
+              missing_vpks
+            ),
+          ));
+          continue;
+        }
+
         log::info!("Successfully updated mod: {}", mod_data.mod_id);
         succeeded.push(mod_data.mod_id.clone());
 

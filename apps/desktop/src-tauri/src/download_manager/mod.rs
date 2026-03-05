@@ -25,6 +25,7 @@ pub struct DownloadTask {
   pub profile_folder: Option<String>,
   pub is_profile_import: bool,
   pub file_tree: Option<crate::mod_manager::file_tree::ModFileTree>,
+  pub preferred_file_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -290,14 +291,14 @@ impl DownloadManager {
       }
     }
 
-    {
-      let mut active = active_downloads.lock().await;
-      active.remove(&mod_id);
-    }
-
     if !errors.is_empty() {
       let error_message = errors.join("; ");
       log::error!("Download failed for mod {mod_id}: {error_message}");
+
+      {
+        let mut active = active_downloads.lock().await;
+        active.remove(&mod_id);
+      }
 
       app_handle
         .emit(
@@ -317,9 +318,21 @@ impl DownloadManager {
       downloaded_files.len()
     );
 
+    {
+      let mut active = active_downloads.lock().await;
+      if let Some(download) = active.get_mut(&mod_id) {
+        download.status = "processing".to_string();
+      }
+    }
+
     // Extract archives and copy VPKs to addons with prefix
     if let Err(e) = Self::process_downloaded_files(&task, &downloaded_files, &app_handle).await {
       log::error!("Failed to process downloaded files for mod {mod_id}: {e}");
+
+      {
+        let mut active = active_downloads.lock().await;
+        active.remove(&mod_id);
+      }
 
       app_handle
         .emit(
@@ -332,6 +345,11 @@ impl DownloadManager {
         .ok();
 
       return Err(e);
+    }
+
+    {
+      let mut active = active_downloads.lock().await;
+      active.remove(&mod_id);
     }
 
     app_handle
@@ -397,6 +415,22 @@ impl DownloadManager {
 
     // Extract archives and analyze file tree
     for file_path in downloaded_files {
+      if let Some(ref preferred_file_name) = task.preferred_file_name {
+        let current_file_name = file_path
+          .file_name()
+          .and_then(|n| n.to_str())
+          .unwrap_or("");
+
+        if current_file_name != preferred_file_name {
+          log::info!(
+            "Skipping processing for non-selected variant archive: {} (preferred: {})",
+            current_file_name,
+            preferred_file_name
+          );
+          continue;
+        }
+      }
+
       if extractor.is_supported_archive(file_path) {
         log::info!("Extracting archive: {file_path:?}");
 
@@ -458,11 +492,9 @@ impl DownloadManager {
                     ));
                   }
 
-                  // Clean up extracted directory and archive after successful copy
+                  // Clean up extracted directory after successful copy
                   log::info!("Removing extracted directory: {extracted_dir:?}");
                   std::fs::remove_dir_all(&extracted_dir)?;
-                  log::info!("Removing archive: {file_path:?}");
-                  std::fs::remove_file(file_path)?;
 
                   log::info!(
                     "Successfully copied {} selected VPKs for profile import mod: {}",
@@ -512,11 +544,9 @@ impl DownloadManager {
             );
             vpk_manager.copy_vpks_with_prefix(&extracted_dir, &addons_path, &task.mod_id)?;
 
-            // Clean up extracted directory and archive after successful copy
+            // Clean up extracted directory after successful copy
             log::info!("Removing extracted directory: {extracted_dir:?}");
             std::fs::remove_dir_all(&extracted_dir)?;
-            log::info!("Removing archive: {file_path:?}");
-            std::fs::remove_file(file_path)?;
           }
           Err(e) => {
             log::warn!(
@@ -527,7 +557,6 @@ impl DownloadManager {
             // Fallback to normal copy if analysis fails
             vpk_manager.copy_vpks_with_prefix(&extracted_dir, &addons_path, &task.mod_id)?;
             std::fs::remove_dir_all(&extracted_dir)?;
-            std::fs::remove_file(file_path)?;
           }
         }
       }

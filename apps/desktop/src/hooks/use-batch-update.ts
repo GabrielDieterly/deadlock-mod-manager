@@ -109,7 +109,9 @@ export const useBatchUpdate = () => {
     );
   };
 
-  const executeBatchUpdate = async (): Promise<void> => {
+  const executeBatchUpdate = async (options?: {
+    downloadAllVariants?: boolean;
+  }): Promise<void> => {
     const activeProfile = getActiveProfile();
     const profileFolder = activeProfile?.folderName ?? "";
 
@@ -131,16 +133,26 @@ export const useBatchUpdate = () => {
 
     const batchUpdateMods: ProfileImportMod[] = updatableMods.map((um) => {
       const localMod = localMods.find((m) => m.remoteId === um.mod.remoteId);
+      const shouldCacheAllVariants =
+        options?.downloadAllVariants && um.downloads.length > 1;
+
       return {
         modId: um.mod.remoteId,
         modName: um.mod.name,
-        downloadFiles: um.selectedDownloads.map((d) => ({
+        downloadFiles: (shouldCacheAllVariants
+          ? um.downloads
+          : um.selectedDownloads
+        ).map((d) => ({
           url: d.url,
           name: d.name,
           size: d.size,
         })),
         fileTree: um.selectedFileTree,
         installedVpks: localMod?.installedVpks ?? [],
+        selectedVariantFileName:
+          shouldCacheAllVariants && um.selectedDownloads.length > 0
+            ? um.selectedDownloads[0].name
+            : undefined,
       };
     });
 

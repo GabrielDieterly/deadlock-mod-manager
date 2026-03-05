@@ -114,6 +114,7 @@ export interface ProfileImportMod {
   }>;
   fileTree?: ModFileTree;
   installedVpks?: string[];
+  selectedVariantFileName?: string;
 }
 
 export interface ProfileImportProgressEvent {

@@ -233,8 +233,16 @@ export const toggleCrosshairLike = async (id: string) => {
 // Local addon analysis functions
 export const analyzeLocalAddons = async (
   profileFolder: string | null = null,
+  trackedInstalledMods: Array<{
+    modId: string;
+    modName: string;
+    installedVpks: string[];
+  }> = [],
 ): Promise<AnalyzeAddonsResult> => {
-  return await invoke("analyze_local_addons", { profileFolder });
+  return await invoke("analyze_local_addons", {
+    profileFolder,
+    trackedMods: trackedInstalledMods,
+  });
 };
 
 export const getProfileInstalledVpks = async (

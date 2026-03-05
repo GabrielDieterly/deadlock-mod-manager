@@ -1,5 +1,6 @@
 use crate::errors::Error;
 use futures::StreamExt;
+use reqwest::header::{RETRY_AFTER, USER_AGENT};
 use std::path::Path;
 use std::time::Instant;
 use tokio::fs::File;
@@ -9,6 +10,13 @@ use tokio_util::sync::CancellationToken;
 #[allow(dead_code)]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer for future use
 const PROGRESS_THROTTLE_MS: u128 = 500; // Emit progress every 500ms
+const MAX_DOWNLOAD_RETRIES: usize = 4;
+const BASE_RETRY_BACKOFF_MS: u64 = 1500;
+const APP_USER_AGENT: &str = concat!(
+  "DeadlockModManager/",
+  env!("CARGO_PKG_VERSION"),
+  " (+https://deadlockmods.app)"
+);
 
 #[derive(Clone, Debug)]
 pub struct DownloadProgress {
@@ -27,19 +35,64 @@ where
 {
   log::info!("Starting download from {url} to {target_path:?}");
 
-  let client = reqwest::Client::new();
-  let response = client
-    .get(url)
-    .send()
-    .await
-    .map_err(|e| Error::Network(format!("Failed to send request: {e}")))?;
+  let client = reqwest::Client::builder()
+    .user_agent(APP_USER_AGENT)
+    .build()
+    .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
 
-  if !response.status().is_success() {
-    return Err(Error::Network(format!(
-      "Server returned error status: {}",
-      response.status()
-    )));
+  let mut response = None;
+  for attempt in 0..=MAX_DOWNLOAD_RETRIES {
+    if cancel_token.is_cancelled() {
+      log::info!("Download cancelled before request start");
+      return Err(Error::DownloadCancelled);
+    }
+
+    let request = client.get(url).header(USER_AGENT, APP_USER_AGENT);
+    let attempt_response = request
+      .send()
+      .await
+      .map_err(|e| Error::Network(format!("Failed to send request: {e}")))?;
+
+    if attempt_response.status().is_success() {
+      response = Some(attempt_response);
+      break;
+    }
+
+    let status = attempt_response.status();
+    let is_retryable = status.as_u16() == 429 || status.is_server_error();
+
+    if !is_retryable || attempt == MAX_DOWNLOAD_RETRIES {
+      return Err(Error::Network(format!(
+        "Server returned error status: {}",
+        status
+      )));
+    }
+
+    let retry_after_ms = attempt_response
+      .headers()
+      .get(RETRY_AFTER)
+      .and_then(|header| header.to_str().ok())
+      .and_then(|value| value.parse::<u64>().ok())
+      .map(|seconds| seconds.saturating_mul(1000));
+
+    let backoff_ms = retry_after_ms
+      .unwrap_or(BASE_RETRY_BACKOFF_MS.saturating_mul(2u64.saturating_pow(attempt as u32)));
+
+    log::warn!(
+      "Download request for {} failed with status {} (attempt {}/{}). Retrying in {}ms",
+      url,
+      status,
+      attempt + 1,
+      MAX_DOWNLOAD_RETRIES + 1,
+      backoff_ms
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
   }
+
+  let response = response.ok_or_else(|| {
+    Error::Network("Failed to get successful download response after retries".to_string())
+  })?;
 
   let total_size = response.content_length().unwrap_or(0);
   log::info!("Download size: {total_size} bytes");

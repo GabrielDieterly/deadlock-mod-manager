@@ -460,23 +460,26 @@ export const createProfilesSlice: StateCreator<State, [], [], ProfilesState> = (
       const updatedLocalMods: LocalMod[] = [];
 
       for (const mod of localMods) {
-        // Check if this mod has any VPKs in the profile folder (enabled or disabled)
-        const hasVpksInProfile = allVpks.some(
-          (vpk) => vpk.startsWith(`${mod.remoteId}_`) || enabledVpkSet.has(vpk),
+        const hasPrefixedVpks = allVpks.some((vpk) =>
+          vpk.startsWith(`${mod.remoteId}_`),
         );
+
+        // Check if the mod has enabled VPKs (based on this mod's tracked installed VPK filenames)
+        const hasEnabledVpks =
+          mod.installedVpks?.some((installedVpk) => {
+            const filename = installedVpk.split(/[\\/]/).pop() || "";
+            return enabledVpkSet.has(filename);
+          }) ?? false;
+
+        // A mod is present in this profile only if it has its own prefixed VPKs
+        // or its own tracked enabled VPK filenames exist in the profile folder.
+        const hasVpksInProfile = hasPrefixedVpks || hasEnabledVpks;
 
         if (!hasVpksInProfile) {
           // Mod doesn't have any VPKs in this profile
           updatedLocalMods.push(mod);
           continue;
         }
-
-        // Check if the mod has enabled VPKs
-        const hasEnabledVpks =
-          mod.installedVpks?.some((installedVpk) => {
-            const filename = installedVpk.split(/[\\/]/).pop() || "";
-            return enabledVpkSet.has(filename);
-          }) ?? false;
 
         if (hasEnabledVpks) {
           // Mod is enabled in this profile
