@@ -48,7 +48,7 @@ export const OnboardingStepAddons = ({ onComplete }: AddonsStepProps) => {
   });
 
   const analyzeMutation = useMutation({
-    mutationFn: analyzeLocalAddons,
+    mutationFn: (pf: string | null) => analyzeLocalAddons(pf),
     onSuccess: (result) => {
       setAnalysisResult(result);
       setShowAnalysisDialog(true);

@@ -67,7 +67,10 @@ const GetModsData = () => {
       filtered = filtered.filter((mod) => {
         let matchesCategory = selectedCategories.includes(mod.category);
 
-        if (!matchesCategory && selectedCategories.includes(ModCategory.OTHER_MISC)) {
+        if (
+          !matchesCategory &&
+          selectedCategories.includes(ModCategory.OTHER_MISC)
+        ) {
           matchesCategory = !predefinedCategorySet.has(mod.category);
         }
 
